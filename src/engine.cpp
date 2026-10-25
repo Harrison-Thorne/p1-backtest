@@ -41,7 +41,7 @@ enum class OrderType { Limit, Market, DcaMerged };
 // 对应 JS 数据库 orders 表的一行（只保留撮合层用得到的列）
 struct Order {
     int id;
-    std::string symbol;
+    int symbol;          // 币种编号（开单时把名字换成编号，之后比较币种只比整数）
     Side side;
     OrderType type;
     double entry_price;
@@ -110,10 +110,16 @@ private:
     // ---- 账户（JS database.js 的 paper_account）----
     double available() const {
         double used = 0;
-        for (const Order& o : orders_) {
-            if (!o.closed) used += o.margin_used;
+        for (std::size_t i : open_) {
+            if (!orders_[i].closed) used += orders_[i].margin_used;
         }
         return equity_ - used;
+    }
+
+    // 把已经平掉的单从 open_ 里清出去（保持原来的先后顺序）
+    void compact_open() {
+        open_.erase(std::remove_if(open_.begin(), open_.end(), [this](std::size_t i) { return orders_[i].closed; }),
+                    open_.end());
     }
 
     // JS database.js saveTradeLog：按价格差算盈亏，计入净值
@@ -142,7 +148,7 @@ private:
     void open_order(const OrderIntent& in);
 
     // ---- 撮合（JS monitor.js）----
-    void replay_symbol_candle(const std::string& symbol, const Candle& c);
+    void replay_symbol_candle(int symbol, const Candle& c);
     bool try_fill_limit(Order& o, double fill_probe);
     void check_position(Order& o, double sl_probe, double tp_probe);
     void check_tp(Order& o, double mark);
@@ -159,6 +165,16 @@ private:
     bool trail_after_tp1_;
     std::vector<Order> orders_;     // 按开单顺序（= JS 的 id 顺序）
     std::map<int, std::size_t> index_;
+    // 还没平的单在 orders_ 里的下标（按开单顺序）。每根 K 线只扫这些，不必把几百张已平的单都看一遍。
+    // 单在一根 K 线中途被平掉时先只打 closed 标记，下一根开始前再统一清掉，所以遍历时仍要看 closed
+    std::vector<std::size_t> open_;
+    // 币种编号 → 名字 / K 线。每张单开单时查一次 map，之后每根 K 线只用编号，不再比较字符串
+    std::map<std::string, int> symbol_ids_;
+    std::vector<const CandleSeries*> series_;   // 没有 K 线的币种为 nullptr
+    // 每根 K 线都要用的临时表，放成成员反复复用，避免每分钟都申请、释放一次内存
+    std::vector<int> active_symbols_;
+    std::vector<char> symbol_seen_;
+    std::vector<int> scratch_ids_;
     double equity_;
     double peak_;
     std::int64_t now_ = 0;
@@ -183,9 +199,16 @@ void Backtester::open_order(const OrderIntent& in) {
     if (balance < margin || lots < 1) return;   // JS：余额不足 / 不足 1 张 → 不开单
     result_.openings.push_back({in.id, balance, margin, size});
 
+    auto [it, inserted] = symbol_ids_.emplace(in.symbol, static_cast<int>(series_.size()));
+    if (inserted) {
+        auto c = ds_.candles.find(in.symbol);
+        series_.push_back(c == ds_.candles.end() ? nullptr : &c->second);
+        symbol_seen_.push_back(0);
+    }
+
     Order o{};
     o.id = in.id;
-    o.symbol = in.symbol;
+    o.symbol = it->second;
     o.side = in.side;
     o.type = in.is_limit ? OrderType::Limit : OrderType::Market;
     o.entry_price = in.entry_price;
@@ -204,19 +227,22 @@ void Backtester::open_order(const OrderIntent& in) {
     o.contract_known = in.contract_known;
     o.size_scale = in.size > 0 ? size / in.size : 1.0;
     index_[o.id] = orders_.size();
+    open_.push_back(orders_.size());
     orders_.push_back(std::move(o));
 }
 
 // JS replaySymbolCandle：先处理限价成交，再按「先止损后止盈」推进持仓
-void Backtester::replay_symbol_candle(const std::string& symbol, const Candle& c) {
+void Backtester::replay_symbol_candle(int symbol, const Candle& c) {
     in_engine_ = true;
-    // 先把这一刻的挂单列表定下来（JS 是一次 SQL 查询），之后成交的单不会重复处理
-    std::vector<int> limits;
-    for (const Order& o : orders_) {
-        if (!o.closed && o.symbol == symbol && o.type == OrderType::Limit) limits.push_back(o.id);
+    // 先把这一刻的挂单列表定下来（JS 是一次 SQL 查询），之后成交的单不会重复处理。
+    // 存下标而不是指针：下标在 orders_ 不扩容时一直有效（K 线推进期间不会开新单）
+    scratch_ids_.clear();
+    for (std::size_t i : open_) {
+        const Order& o = orders_[i];
+        if (!o.closed && o.symbol == symbol && o.type == OrderType::Limit) scratch_ids_.push_back(static_cast<int>(i));
     }
-    for (int id : limits) {
-        Order& lo = *find(id);
+    for (int idx : scratch_ids_) {
+        Order& lo = orders_[static_cast<std::size_t>(idx)];
         if (lo.closed) continue;
         if ((ds_.flags.entry_mid_to_sl || ds_.flags.cmp_to_image_limit) && lo.tp[0]) {
             const bool reached_tp1 = lo.is_long() ? c.high >= *lo.tp[0] : c.low <= *lo.tp[0];
@@ -228,12 +254,13 @@ void Backtester::replay_symbol_candle(const std::string& symbol, const Candle& c
         try_fill_limit(lo, lo.is_long() ? c.low : c.high);
     }
 
-    std::vector<int> live;
-    for (const Order& o : orders_) {
-        if (!o.closed && o.symbol == symbol && o.type == OrderType::Market) live.push_back(o.id);
+    scratch_ids_.clear();
+    for (std::size_t i : open_) {
+        const Order& o = orders_[i];
+        if (!o.closed && o.symbol == symbol && o.type == OrderType::Market) scratch_ids_.push_back(static_cast<int>(i));
     }
-    for (int id : live) {
-        Order& o = *find(id);
+    for (int idx : scratch_ids_) {
+        Order& o = orders_[static_cast<std::size_t>(idx)];
         const double adverse = o.is_long() ? c.low : c.high;
         const double favorable = o.is_long() ? c.high : c.low;
         // check_tp 每次只推进一档，同一根 K 线反复推进，直到平仓或不再有进展（JS 同样上限 6 次，只比较前 5 档）
@@ -255,7 +282,8 @@ bool Backtester::try_fill_limit(Order& o, double fill_probe) {
     if (!filled) return false;
 
     Order* primary = nullptr;
-    for (Order& other : orders_) {
+    for (std::size_t i : open_) {
+        Order& other = orders_[i];
         if (!other.closed && other.id != o.id && other.symbol == o.symbol && other.side == o.side &&
             other.type == OrderType::Market) {
             primary = &other;
@@ -387,7 +415,8 @@ void Backtester::perform_exit(Order& o, const std::string& reason, double close_
 
 // JS cancelPendingLimits：TP1 后撤掉同币种同方向还没成交的挂单（不再加仓）
 void Backtester::cancel_pending_limits(const Order& filled, const std::string& /*reason*/) {
-    for (Order& o : orders_) {
+    for (std::size_t i : open_) {
+        Order& o = orders_[i];
         if (!o.closed && o.type == OrderType::Limit && o.symbol == filled.symbol && o.side == filled.side) {
             o.closed = true;
         }
@@ -483,10 +512,9 @@ void Backtester::finish(std::int64_t end_ms) {
     for (Order& o : orders_) {
         if (o.closed || o.type == OrderType::Limit) continue;
         double px = o.entry_price;
-        auto it = ds_.candles.find(o.symbol);
-        if (it != ds_.candles.end()) {
-            const Candle* c = it->second.at(grid);
-            if (!c) c = it->second.at(grid - ds_.gran_ms);
+        if (const CandleSeries* series = series_[static_cast<std::size_t>(o.symbol)]) {
+            const Candle* c = series->at(grid);
+            if (!c) c = series->at(grid - ds_.gran_ms);
             if (c) px = c->close;
         }
         perform_exit(o, "backtest_end_mtm", px);
@@ -512,16 +540,19 @@ Result Backtester::run() {
     for (std::int64_t gt = start; gt <= end_ms; gt += gran) {
         now_ = gt;
         // 1) 用这根 K 线推进所有有未平订单的币种（按订单顺序去重，和 JS 一致）
-        std::vector<std::string> symbols;
-        for (const Order& o : orders_) {
-            if (!o.closed && std::find(symbols.begin(), symbols.end(), o.symbol) == symbols.end()) {
-                symbols.push_back(o.symbol);
-            }
+        compact_open();
+        active_symbols_.clear();
+        for (std::size_t i : open_) {
+            const Order& o = orders_[i];
+            if (o.closed || symbol_seen_[static_cast<std::size_t>(o.symbol)]) continue;
+            symbol_seen_[static_cast<std::size_t>(o.symbol)] = 1;
+            active_symbols_.push_back(o.symbol);
         }
-        for (const std::string& sym : symbols) {
-            auto it = ds_.candles.find(sym);
-            if (it == ds_.candles.end()) continue;
-            if (const Candle* c = it->second.at(gt)) replay_symbol_candle(sym, *c);
+        for (int sym : active_symbols_) {
+            symbol_seen_[static_cast<std::size_t>(sym)] = 0;
+            const CandleSeries* series = series_[static_cast<std::size_t>(sym)];
+            if (!series) continue;
+            if (const Candle* c = series->at(gt)) replay_symbol_candle(sym, *c);
         }
         // 2) 再处理时间落在这根 K 线之前的消息：开单和决策层事件按全局序号交错
         while (true) {
@@ -540,8 +571,19 @@ Result Backtester::run() {
         peak_ = std::max(peak_, equity_);
         if (peak_ > 0) result_.max_drawdown_pct = std::max(result_.max_drawdown_pct, (peak_ - equity_) / peak_ * 100.0);
 
-        const bool any_open = std::any_of(orders_.begin(), orders_.end(), [](const Order& o) { return !o.closed; });
+        compact_open();
+        const bool any_open = !open_.empty();
         if (gt >= ds_.last_message_ms && !any_open) break;   // 消息处理完且没有持仓，提前结束
+
+        // 空仓时中间这些 K 线什么都不会发生（没有要推进的单，净值也不变）：直接跳到下一条消息所在的那根。
+        // 结果和逐根走完全一样，但几个月的空仓期不用再一分钟一分钟地空转
+        if (!any_open) {
+            std::int64_t next_t = end_ms;
+            if (next_order < ds_.orders.size()) next_t = std::min(next_t, ds_.orders[next_order].t_ms);
+            if (next_event < ds_.events.size()) next_t = std::min(next_t, ds_.events[next_event].t_ms);
+            const std::int64_t next_grid = (next_t + gran - 1) / gran * gran;   // 第一根不早于 next_t 的 K 线
+            if (next_grid > gt + gran) gt = next_grid - gran;                   // 循环末尾还会再加一个 gran
+        }
     }
     finish(end_ms);
     result_.final_equity = equity_;

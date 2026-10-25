@@ -1,0 +1,14 @@
+build*/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.out
+*:Zone.Identifier
+.vscode/
+.idea/
+.cache/
+compile_commands.json
+
+# 真实导出数据（含频道信号）只放本地，仓库只提交 data/sample
+data/exports/

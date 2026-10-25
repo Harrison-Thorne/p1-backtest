@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: release
+            cmake_args: -DCMAKE_BUILD_TYPE=Release
+          - name: tsan
+            cmake_args: -DCMAKE_BUILD_TYPE=Debug -DENABLE_TSAN=ON
+          - name: asan-ubsan
+            cmake_args: -DCMAKE_BUILD_TYPE=Debug -DENABLE_ASAN=ON
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install GoogleTest
+        run: sudo apt-get update && sudo apt-get install -y libgtest-dev
+
+      - name: Configure
+        run: cmake -S . -B build ${{ matrix.cmake_args }}
+
+      # setarch -R disables ASLR for TSan on newer kernels; harmless for the other jobs
+      - name: Build
+        run: setarch "$(uname -m)" -R cmake --build build -j "$(nproc)"
+
+      - name: Test
+        env:
+          TSAN_OPTIONS: halt_on_error=1
+        run: setarch "$(uname -m)" -R ctest --test-dir build --output-on-failure

@@ -1,0 +1,3 @@
+[submodule "third_party/p0-concurrency"]
+	path = third_party/p0-concurrency
+	url = https://github.com/Harrison-Thorne/p0-concurrency.git

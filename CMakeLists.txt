@@ -31,17 +31,20 @@ if(NOT EXISTS ${P0_DIR}/include/conc/work_stealing_pool.h)
   message(FATAL_ERROR "p0-concurrency submodule missing: run `git submodule update --init`")
 endif()
 
-add_library(bt STATIC src/dataset.cpp src/engine.cpp src/golden.cpp)
+add_library(bt STATIC src/dataset.cpp src/engine.cpp src/golden.cpp src/sweep.cpp)
 target_include_directories(bt PUBLIC include ${P0_DIR}/include)
 target_link_libraries(bt PUBLIC Threads::Threads)
 
 add_executable(golden_check apps/golden_check.cpp)
 target_link_libraries(golden_check PRIVATE bt)
 
+add_executable(sweep apps/sweep.cpp)
+target_link_libraries(sweep PRIVATE bt)
+
 enable_testing()
 find_package(GTest REQUIRED)
 include(GoogleTest)
-add_executable(test_engine tests/test_engine.cpp tests/test_golden.cpp)
+add_executable(test_engine tests/test_engine.cpp tests/test_golden.cpp tests/test_sweep.cpp)
 target_link_libraries(test_engine PRIVATE bt GTest::gtest_main)
 target_compile_definitions(test_engine PRIVATE SAMPLE_DIR="${CMAKE_SOURCE_DIR}/data/sample")
 gtest_discover_tests(test_engine PROPERTIES TIMEOUT 120)

@@ -1,0 +1,10 @@
+# Engine before/after (scripts/compare_engine_versions.sh, 2026-10-26, same machine and data as summary.md)
+before = M3 (ca40ae7)
+after = M4 (139c52a)
+before run 1: 4800 backtests (10 channels x 480 parameter sets) on 20 workers in 160.61 s
+before run 2: 4800 backtests (10 channels x 480 parameter sets) on 20 workers in 159.57 s
+before run 3: 4800 backtests (10 channels x 480 parameter sets) on 20 workers in 159.14 s
+after run 1: 4800 backtests (10 channels x 480 parameter sets) on 20 workers in 53.35 s
+after run 2: 4800 backtests (10 channels x 480 parameter sets) on 20 workers in 52.85 s
+after run 3: 4800 backtests (10 channels x 480 parameter sets) on 20 workers in 57.08 s
+sweep results identical

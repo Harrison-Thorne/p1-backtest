@@ -41,6 +41,9 @@ target_link_libraries(golden_check PRIVATE bt)
 add_executable(sweep apps/sweep.cpp)
 target_link_libraries(sweep PRIVATE bt)
 
+add_executable(bench_sweep bench/bench_sweep.cpp)
+target_link_libraries(bench_sweep PRIVATE bt)
+
 enable_testing()
 find_package(GTest REQUIRED)
 include(GoogleTest)
